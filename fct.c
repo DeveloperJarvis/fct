@@ -83,6 +83,14 @@ typedef struct
 	bool is_compress;
 } command_line_args;
 
+// Structure for Minheap
+typedef struct
+{
+	huffman_node **arr;
+	int size;
+	int capacity;
+} minheap;
+
 // --------------------------------
 // Forward function declarations/ prototypes
 // --------------------------------
@@ -100,16 +108,22 @@ int read_file(FILE *fptr, void *buffer, size_t size);
 int write_file(FILE *fptr, const void *buffer, size_t size);
 void close_file(FILE *fptr);
 
+// Manage heap
+minheap *heap_create(int capacity);
+void heap_swap(huffman_node **a, huffman_node **b);
+void heap_push(minheap *h, huffman_node *node);
+huffman_node *heap_pop(minheap *h);
+
 // Compression/ Descompression Algorithm
 // Compression
 void build_frequency_table(const char *file_data, freq_entry *table, int *size);
 huffman_node *build_huffman_tree(const freq_entry *table, int size);
 void generate_huffman_codes(huffman_node *root, char *code, int length, huffman_code *codes, int *index);
-void compress_data(const char *file_data, const huffman_code *codes, char *compressed_data, int *compressed_size);
+void compress_data(const char *file_data, const huffman_code *codes, int freq_size, char *compressed_data, int *compressed_size);
 // Decompression
 // void decode_data(const char *compressed_data, int compressed_size);
-// void build_huffman_tree_from_file(char *file_data);
-void decompress_data(const char *compressed_data, int compressed_size, huffman_node *root, char *decompressed_data);
+huffman_node *build_huffman_tree_from_file(FILE *input_file);
+void huffman_decompress(const char *compressed_data, int compressed_size, huffman_node *root, char *decompressed_data);
 
 // free tree and other data
 void free_huffman_tree(huffman_node *root);
@@ -151,8 +165,22 @@ int main(int argc, char *argv[])
 			perror("Error allocating memory for codes\n");
 			exit(1);
 		}
+
+		/* NEW: intialize entries so they don't contain garbage values */
+		for (int i = 0; i < freq_size; i++)
+		{
+			codes[i].character = '\0';
+			codes[i].code = NULL;
+		}
 		int code_index = 0;
-		generate_huffman_codes(root, "", 0, codes, &code_index);
+		char temp_code[256];
+		generate_huffman_codes(root, temp_code, 0, codes, &code_index);
+		for (int i = 0; i < freq_size; i++)
+		{
+			printf(" '%c' -> %s\n",
+				   codes[i].character,
+				   codes[i].code ? codes[i].code : "(NULL)");
+		}
 
 		char *compressed_data = (char *)malloc(file_size); // This is an estimation, could be optimized
 		if (compressed_data == NULL)
@@ -161,10 +189,15 @@ int main(int argc, char *argv[])
 			exit(1);
 		}
 		int compressed_size = 0;
-		compress_data(file_data, codes, compressed_data, &compressed_size);
+		compress_data(file_data, codes, freq_size, compressed_data, &compressed_size);
 
 		// Write comressed data to output file
 		FILE *output_file = open_file(args.output_file, "wb");
+		// write freq_size
+		write_file(output_file, &freq_size, sizeof(int));
+		// write freq entries
+		write_file(output_file, freq_table, sizeof(freq_entry) * freq_size);
+		// the write compressed data
 		write_file(output_file, compressed_data, compressed_size);
 		close_file(output_file);
 
@@ -177,12 +210,40 @@ int main(int argc, char *argv[])
 	else
 	{
 		// Decompression
-		// For now, we'll assume a trivial decompression (real-world scenario would store tree info)
-		// Decompression would require rebuilding the Huffman tree from the compressed data
+		// ---- reopen file (closed input_file from earlier) ----
+		FILE *input_file = open_file(args.input_file, "rb");
+
+		// ---- rebuild Huffman tree ----
+		huffman_node *root = build_huffman_tree_from_file(input_file);
+
+		// ---- read remaining bytes (compressed bitstream) ----
+		long start_pos = ftell(input_file);
+		fseek(input_file, 0, SEEK_END);
+		long end_pos = ftell(input_file);
+		fseek(input_file, start_pos, SEEK_SET);
+
+		long compressed_size = end_pos - start_pos;
+
+		char *compressed_data = malloc(compressed_size);
+		fread(compressed_data, 1, compressed_size, input_file);
+		close_file(input_file);
+
+		// ---- allocating decompression output buffer ----
+		// Worst case: 1 bit per char => compressed_size * 8
+		char *decompressed = malloc(compressed_size * 8 + 1); // safe buffer
+
+		// ---- perform decompression
+		huffman_decompress(compressed_data, compressed_size, root, decompressed);
+
+		// ---- write output ----
 		FILE *output_file = open_file(args.output_file, "wb");
-		// Implement decompression here based on the compressed file's structure
-		// Placeholder, needs proper tree reconstruction from compressed file format
+		fwrite(decompressed, 1, strlen(decompressed), output_file);
 		close_file(output_file);
+
+		// ---- close ----
+		free(decompressed);
+		free(compressed_data);
+		free_huffman_tree(root);
 	}
 
 	return 0;
@@ -233,6 +294,7 @@ void parse_command_line_arguments(int argc, char *argv[], command_line_args *arg
 	if (strcmp(argv[1], "-c") == 0)
 	{
 		args->is_compress = true;
+		printf("1");
 	}
 	else if (strcmp(argv[1], "-d") == 0)
 	{
@@ -309,23 +371,39 @@ void build_frequency_table(const char *file_data, freq_entry *table, int *size)
 // Helper function to build a Huffman tree
 huffman_node *build_huffman_tree(const freq_entry *table, int size)
 {
-	// Simplified version
-	// Use a min-heap or priority queue to build the tree
-	// This is a simplified placeholder
-	huffman_node *root = (huffman_node *)malloc(sizeof(huffman_node));
-	if (root == NULL)
-	{
-		perror("Error allocating memory for root\n");
-		exit(1);
-	}
-	root->character = table[0].character;
-	root->frequency = table[0].frequency;
-	root->left = root->right = NULL;
+	if (size == 0)
+		return NULL;
 
+	minheap *h = heap_create(size);
+
+	// Create leaf nodes
 	for (int i = 0; i < size; i++)
 	{
-		// process table[i] as needed
+		huffman_node *node = malloc(sizeof(huffman_node));
+		node->character = table[i].character;
+		node->frequency = table[i].frequency;
+		node->left = node->right = NULL;
+		heap_push(h, node);
 	}
+
+	// Build the tree
+	while (h->size > 1)
+	{
+		huffman_node *left = heap_pop(h);
+		huffman_node *right = heap_pop(h);
+
+		huffman_node *parent = malloc(sizeof(huffman_node));
+		parent->character = '\0'; // internal node
+		parent->frequency = left->frequency + right->frequency;
+		parent->left = left;
+		parent->right = right;
+
+		heap_push(h, parent);
+	}
+
+	huffman_node *root = heap_pop(h);
+	free(h->arr);
+	free(h);
 
 	return root;
 }
@@ -363,11 +441,11 @@ void generate_huffman_codes(huffman_node *root, char *code, int length, huffman_
 }
 
 // Placeholder for compressing data
-void compress_data(const char *file_data, const huffman_code *codes, char *compressed_data, int *compressed_size)
+void compress_data(const char *file_data, const huffman_code *codes, int freq_size, char *compressed_data, int *compressed_size)
 {
 	// Implemented compression logic using Huffman codes
 	// This is a simplified placeholder for actual bit manipulation
-	unsigned char *bit_stream = (unsigned char *)malloc(MAX_CHARACTERS * sizeof(unsigned char)); // Allocate memory for the bitstream
+	unsigned char *bit_stream = (unsigned char *)calloc(1, MAX_CHARACTERS); // Allocate memory for the bitstream
 	if (bit_stream == NULL)
 	{
 		perror("Error allocating memory for bitstream");
@@ -377,22 +455,40 @@ void compress_data(const char *file_data, const huffman_code *codes, char *compr
 
 	for (int i = 0; file_data[i] != '\0'; i++)
 	{
-		for (int j = 0; j < MAX_CHARACTERS; j++)
+		char ch = file_data[i];
+
+		// FIND CODE (safer)
+		const char *code = NULL;
+		for (int j = 0; j < freq_size; j++)
 		{
-			if (codes[j].character == file_data[i])
+			if (codes[j].character == ch)
 			{
-				// Store the Huffman code for the character (bit-level manipulation required)
-				// strcat(compressed_data, codes[j].code);
-				for (int k = 0; codes[j].code[k] != '\0'; k++)
-				{
-					bit_stream[bit_index / 8] |= (1 << (7 - (bit_index % 8))); // Set the bit to 1
-				}
-				bit_index++;
+				code = codes[j].code;
+				break;
 			}
 		}
+		if (code == NULL)
+		{
+			printf("ERROR: missing Huffman code for %c\n", ch);
+			exit(1);
+		}
+
+		printf("Huffman code for character %c: %s\n", ch, code);
+
+		// Store the Huffman code for the character (bit-level manipulation required)
+		// strcat(compressed_data, codes[j].code);
+		// Store bits
+		for (int k = 0; code[k] != '\0'; k++)
+		{
+			if (code[k] == '1')
+			{
+				bit_stream[bit_index / 8] |= (1 << (7 - (bit_index % 8))); // Set the bit to 1
+			}
+			bit_index++;
+		}
 	}
+
 	// Calculate the final size (in bytes) for the compressed data
-	//*compressed_size = strlen(compressed_data);
 	*compressed_size = (bit_index + 7) / 8;
 
 	// Covert the bit steam back to a byte array (if needed) to be written to a file
@@ -402,14 +498,30 @@ void compress_data(const char *file_data, const huffman_code *codes, char *compr
 }
 
 // Placeholder for decompressing data
-void decompress_data(const char *compressed_data, int compressed_size, huffman_node *root, char *decompressed_data)
+void huffman_decompress(const char *compressed_data, int compressed_size, huffman_node *root, char *out)
 {
-	// Implement decompression logic using Huffman tree
-	// This is a simplified placeholder for actual bit-level manipulation
-	(void)compressed_data;	 // Mark unused
-	(void)compressed_size;	 // Mark unused
-	(void)root;				 // Mark unused
-	(void)decompressed_data; // Mark unused
+	int out_index = 0;
+	huffman_node *current = root;
+
+	for (int byte = 0; byte < compressed_size; byte++)
+	{
+		for (int bit = 7; bit >= 0; bit--)
+		{
+			int bit_val = (compressed_data[byte] >> bit) & 1;
+
+			// Travse tree
+			current = (bit_val == 0) ? current->left : current->right;
+
+			// Leaf reached -> output character
+			if (current->left == NULL && current->right == NULL)
+			{
+				out[out_index++] = current->character;
+				current = root;
+			}
+		}
+	}
+
+	out[out_index] = '\0';
 }
 
 // Free allocated memory for Huffman Tree
@@ -430,4 +542,81 @@ void free_huffman_codes(huffman_code *codes, int size)
 		free(codes[i].code);
 	}
 	free(codes);
+}
+
+// Create heap
+minheap *heap_create(int capacity)
+{
+	minheap *h = malloc(sizeof(minheap));
+	h->arr = malloc(sizeof(huffman_node *) * capacity);
+	h->size = 0;
+	h->capacity = capacity;
+	return h;
+}
+
+// Swap heap
+void heap_swap(huffman_node **a, huffman_node **b)
+{
+	huffman_node *tmp = *a;
+	*a = *b;
+	*b = tmp;
+}
+
+// Push heap
+void heap_push(minheap *h, huffman_node *node)
+{
+	int i = h->size++;
+	h->arr[i] = node;
+
+	while (i != 0)
+	{
+		int parent = (i - 1) / 2;
+		if (h->arr[parent]->frequency <= h->arr[i]->frequency)
+			break;
+		heap_swap(&h->arr[parent], &h->arr[i]);
+		i = parent;
+	}
+}
+
+// Pop head
+huffman_node *heap_pop(minheap *h)
+{
+	huffman_node *root = h->arr[0];
+	h->arr[0] = h->arr[--h->size];
+
+	int i = 0;
+	while (1)
+	{
+		int left = 2 * i + 1, right = 2 * i + 2, smallest = i;
+		if (left < h->size && h->arr[left]->frequency < h->arr[smallest]->frequency)
+			smallest = left;
+		if (right < h->size && h->arr[right]->frequency < h->arr[smallest]->frequency)
+			smallest = right;
+
+		if (smallest == i)
+			break;
+
+		heap_swap(&h->arr[i], &h->arr[smallest]);
+		i = smallest;
+	}
+	return root;
+}
+
+huffman_node *build_huffman_tree_from_file(FILE *input_file)
+{
+	int freq_size = 0;
+	fread(&freq_size, sizeof(int), 1, input_file);
+	if (freq_size <= 0 || freq_size > MAX_CHARACTERS)
+	{
+		fprintf(stderr, "Invalid frequency table size in file\n");
+		exit(1);
+	}
+
+	freq_entry *table = malloc(sizeof(freq_entry) * freq_size);
+	fread(table, sizeof(freq_entry), freq_size, input_file);
+
+	huffman_node *root = build_huffman_tree(table, freq_size);
+	free(table);
+
+	return root;
 }
