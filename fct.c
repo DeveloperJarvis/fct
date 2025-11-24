@@ -28,7 +28,7 @@
 
 // --------------------------------
 // FCT: File Compress Tool  will compress and decompress files, primarily using algorithms like
-// *Huffman Coding* or *Run-Length Encoding (RLE)*
+// 		Concepts: *Huffman Coding* or *Run-Length Encoding (RLE)*, minheap for queue management, tree structures for encoding. decoding.
 // --------------------------------
 
 // --------------------------------
